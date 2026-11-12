@@ -1,0 +1,24 @@
+{
+  "name": "hi-ai-cli",
+  "version": "0.1.0",
+  "description": "A usage-aware hello at reset for Claude Code and Codex on macOS and Linux.",
+  "author": "anik-jha",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anik-jha/hi-ai.git"
+  },
+  "homepage": "https://github.com/anik-jha/hi-ai#readme",
+  "bugs": { "url": "https://github.com/anik-jha/hi-ai/issues" },
+  "type": "module",
+  "bin": { "hi-ai": "bin/hi-ai.mjs" },
+  "engines": { "node": ">=22" },
+  "os": ["darwin", "linux"],
+  "files": ["bin/", "lib/", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node --test",
+    "test:live": "node scripts/live-smoke.mjs",
+    "test:live:scheduled": "node scripts/live-scheduled-smoke.mjs",
+    "test:docker": "docker build -f Dockerfile.test -t hi-ai-test . && docker run --rm hi-ai-test"
+  },
+  "license": "MIT"
+}
