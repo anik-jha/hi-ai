@@ -51,6 +51,31 @@ test('Claude resolves year rollover and time-only resets independently of the ho
   assert.equal(normalizeClaudeUsage(claudeResult('Current session: 1% used · resets 3:19am (America/Phoenix)'), claudeNow).resetAt, '2026-11-12T10:20:00.000Z');
 });
 
+// Claude Code formats resets with its runtime's ICU data: macOS system ICU joins
+// the date and time with " at ", the ICU bundled on Linux with ", " (captured
+// live), and both add the year when the reset falls in a different year.
+test('Claude parses the reset formats of both ICU builds', () => {
+  const linux = 'Current session: 4% used · resets Nov 13, 5am (America/Phoenix)';
+  assert.equal(normalizeClaudeUsage(claudeResult(linux), Date.parse('2026-11-13T08:00:00Z')).resetAt, '2026-11-13T12:01:00.000Z');
+  const comma = text => text.replaceAll(' at ', ', ');
+  assert.equal(normalizeClaudeUsage(claudeResult(comma(`${session}\n${week}`)), claudeNow).resetAt, '2026-11-12T10:20:00.000Z');
+  assert.equal(normalizeClaudeUsage(claudeResult(comma(idleSession.replace('31% used', '100% used'))), claudeNow).resetAt, '2026-11-18T00:00:00.000Z');
+  for (const reset of ['Nov 12 3:19am', 'Nov 12,, 3:19am', 'Nov 12, at 3:19am', 'Nov 12 at, 3:19am', 'Nov 12, 26, 3:19am']) {
+    assert.throws(() => normalizeClaudeUsage(claudeResult(session.replace('Nov 12 at 3:19am', reset)), claudeNow), /format is unrecognized/);
+  }
+});
+
+test('Claude resolves resets in the next year, which both formats print with the year', () => {
+  const newYearsEve = Date.parse('2027-01-01T05:00:00Z');
+  for (const reset of ['Jan 1, 2027 at 1am', 'Jan 1, 2027, 1am']) {
+    assert.equal(normalizeClaudeUsage(claudeResult(`Current session: 1% used · resets ${reset} (America/Phoenix)`), newYearsEve).resetAt, '2027-01-01T08:01:00.000Z');
+  }
+  assert.throws(() => normalizeClaudeUsage(claudeResult('Current session: 1% used · resets Jan 1, 2028, 1am (America/Phoenix)'), newYearsEve), /out of range/);
+  const weekly = 'Current week (all models): 100% used · resets Jan 3, 2027, 4:59pm (America/Phoenix)';
+  const reading = normalizeClaudeUsage(claudeResult(`${session.replace('Nov 12 at 3:19am', 'Dec 29 at 1am')}\n${weekly}`), Date.parse('2026-12-29T05:00:00Z'));
+  assert.deepEqual([reading.state, reading.resetAt], ['blocked', '2027-01-04T00:00:00.000Z']);
+});
+
 test('Claude rejects DST gaps and waits for the later occurrence of ambiguous reset times', () => {
   assert.throws(() => normalizeClaudeUsage(claudeResult('Current session: 1% used · resets Mar 8 at 2:30am (America/New_York)'), Date.parse('2026-03-08T05:00:00Z')));
   assert.equal(normalizeClaudeUsage(claudeResult('Current session: 1% used · resets Nov 1 at 1:30am (America/New_York)'), Date.parse('2026-11-01T04:00:00Z')).resetAt, '2026-11-01T06:31:00.000Z');

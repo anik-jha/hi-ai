@@ -13,7 +13,7 @@ A small, usage-aware utility for **Claude Code and Codex**, on macOS and Linux. 
 
 HiAI uses lightweight models by default: Claude's `haiku` alias and Codex's `gpt-6-luna`. It has no npm runtime dependencies, GUI, or HiAI account.
 
-**Release status: 0.1.0.** Usage readers, timing decisions, failure recovery, and native schedulers have tests. Live usage reads, background delivery, and the idle → hello → newly active window transition have been observed on real accounts on macOS; see [Validation](#validation) for what is and is not covered. A hello consumes usage; the provider controls quota and billing.
+**Release status: 0.1.1.** Usage readers, timing decisions, failure recovery, and native schedulers have tests. Live usage reads, background delivery, and the idle → hello → newly active window transition have been observed on real accounts on macOS; see [Validation](#validation) for what is and is not covered. A hello consumes usage; the provider controls quota and billing.
 
 ## Install
 
@@ -100,7 +100,7 @@ A saved provider failure is a completed scheduled check, so the scheduler proces
 
 **Claude:** HiAI runs the installed, unmodified `claude -p /usage --safe-mode --no-session-persistence --output-format json` command. Claude Code owns login and credential refresh. HiAI does not read the Keychain, credential files, access tokens, or refresh tokens, and makes no direct Anthropic HTTP requests.
 
-The command uses a deliberately invalid model name, so a CLI that stops recognizing `/usage` locally cannot silently turn the check into a normal model request. HiAI requires a local `usage` result with zero turns, zero API duration, zero cost, and no model usage before parsing the current-session and all-model weekly lines. The human-readable reset includes a timezone and may omit the year; HiAI handles timezone offsets, year rollover, and daylight-saving changes. Missing or changed output counts as a failed read. Both formats have been captured live: an active session names its reset time, and an idle session reads `0% used` with no reset time.
+The command uses a deliberately invalid model name, so a CLI that stops recognizing `/usage` locally cannot silently turn the check into a normal model request. HiAI requires a local `usage` result with zero turns, zero API duration, zero cost, and no model usage before parsing the current-session and all-model weekly lines. The human-readable reset includes a timezone, and its wording follows the platform's date formatting: `Nov 13 at 5am` on macOS, `Nov 13, 5am` on Linux, with the year added when the reset falls in the next year. HiAI accepts both forms and handles timezone offsets, year rollover, and daylight-saving changes. Missing or changed output counts as a failed read. Both session states have been captured live: an active session names its reset time, and an idle session reads `0% used` with no reset time.
 
 **Codex:** HiAI starts the installed CLI's app server and calls the documented [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server) method. It creates no thread or inference turn and does not parse Codex credential files. An idle Codex account reports an unused window whose reset time moves forward with every read, while a started window keeps a fixed reset. When the window is unused, HiAI reads twice, two seconds apart, and treats a moving reset as idle.
 
