@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { defaults, deliveryConfirmed, execute, findExecutable, Interrupted, providerArgs } from '../lib/core.mjs';
+import { defaults, deliveryConfirmed, execute, findExecutable, Interrupted, providerArgs, STRIPPED_API_KEYS } from '../lib/core.mjs';
 
 if (process.env.HI_AI_LIVE_TEST !== '1') {
   console.error('This sends one real hello to each provider and consumes usage. Run HI_AI_LIVE_TEST=1 npm run test:live to opt in.');
@@ -9,7 +9,7 @@ if (process.env.HI_AI_LIVE_TEST !== '1') {
 } else {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'hi-ai-live-'));
   const env = { ...process.env };
-  for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) delete env[key];
+  for (const key of STRIPPED_API_KEYS) delete env[key];
   let signal;
   try {
     for (const [name, model] of Object.entries(defaults)) {

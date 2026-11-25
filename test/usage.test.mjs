@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizeClaudeUsage, normalizeCodexUsage, readClaudeUsage, readCodexUsage } from '../lib/usage.mjs';
+import { normalizeAntigravityUsage, normalizeClaudeUsage, normalizeCodexUsage, readAntigravityUsage, readClaudeUsage, readCodexUsage } from '../lib/usage.mjs';
 import { prepareScheduled, nextDueAt, run, writeJSON, FIVE_HOURS_MS } from '../lib/core.mjs';
 
 const now = Date.now();
@@ -22,6 +22,35 @@ const idleSession = `Current session: 0% used\n${week}\nCurrent week (Fable): 54
 // window that resets exactly one window length after the read itself.
 const codexIdle = resetsAt => ({ rateLimits: { limitId: 'codex', primary: { usedPercent: 0, windowDurationMins: 300, resetsAt }, secondary: { usedPercent: 27, windowDurationMins: 10080, resetsAt: 1794987570 } } });
 const codexNow = Date.parse('2026-11-12T14:53:22Z');
+// Captured live from Antigravity CLI 1.5.16 on 2026-11-25: Gemini Models had an
+// active 5-hour window with a fixed reset_time, while the unused 3P group moved
+// its reset_time forward on each read.
+const antigravityNow = Date.parse('2026-11-25T05:49:53Z');
+const antigravityResult = ({ gemini5h = { remaining: 0.6350659728050232, reset: '2026-11-25T09:52:39Z' }, geminiWeekly = { remaining: 0.8977535963058472, reset: '2026-12-02T04:52:39Z' }, thirdParty5h = { remaining: 1, reset: '2026-11-25T10:49:53Z' }, thirdPartyWeekly = { remaining: 1, reset: '2026-12-02T05:49:53Z' } } = {}) => ({
+  conversation_id: '', status: 'SUCCESS', response: '', duration_seconds: 0, num_turns: 0,
+  usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+  command: {
+    name: 'usage',
+    data: {
+      groups: [
+        {
+          name: 'Gemini Models',
+          buckets: [
+            { id: 'gemini-weekly', name: 'Weekly Limit Remaining', window: 'weekly', remaining_fraction: geminiWeekly.remaining, reset_time: geminiWeekly.reset },
+            { id: 'gemini-5h', name: 'Five Hour Limit Remaining', window: '5h', remaining_fraction: gemini5h.remaining, reset_time: gemini5h.reset },
+          ],
+        },
+        {
+          name: 'Claude and GPT models',
+          buckets: [
+            { id: '3p-weekly', name: 'Weekly Limit Remaining', window: 'weekly', remaining_fraction: thirdPartyWeekly.remaining, reset_time: thirdPartyWeekly.reset },
+            { id: '3p-5h', name: 'Five Hour Limit Remaining', window: '5h', remaining_fraction: thirdParty5h.remaining, reset_time: thirdParty5h.reset },
+          ],
+        },
+      ],
+    },
+  },
+});
 
 test('Claude parses the captured local /usage result, including active zero-percent windows', () => {
   const reading = normalizeClaudeUsage(claudeResult(session), claudeNow);
@@ -207,6 +236,7 @@ test('Codex reads an unused window whose reset moves with each read as idle', ()
 test('Claude reads only through its CLI with a deliberately invalid model and returns sanitized usage', async () => {
   const calls = [];
   const result = await readClaudeUsage(provider, {
+    now: claudeNow,
     runner: async (executable, args, options) => { calls.push({ executable, args, options }); return { code: 0, stdout: JSON.stringify(claudeResult(idleSession)) }; },
   });
   assert.equal(calls.length, 1);
@@ -216,6 +246,91 @@ test('Claude reads only through its CLI with a deliberately invalid model and re
   assert.equal(calls[0].args.at(-1), 'hi-ai-usage-check-only-invalid-model');
   assert.equal(result.state, 'idle');
   assert.equal('result' in result, false);
+});
+
+test('Antigravity parses captured active Gemini usage, matches the model quota group, and handles weekly blocks', () => {
+  const reading = normalizeAntigravityUsage(antigravityResult(), antigravityNow, undefined, 'gemini-4-hydrogen-low');
+  assert.equal(reading.state, 'active');
+  assert.equal(reading.resetAt, '2026-11-25T09:52:39.000Z');
+  assert.equal(reading.usedPercent, 36.5);
+  assert.equal(reading.source, 'antigravity-cli-usage');
+
+  // An unused bucket whose reset_time moves forward across reads is idle.
+  const later = antigravityResult({ thirdParty5h: { remaining: 1, reset: '2026-11-25T10:49:58Z' }, thirdPartyWeekly: { remaining: 1, reset: '2026-12-02T05:49:58Z' } });
+  const idleThirdParty = normalizeAntigravityUsage(antigravityResult(), antigravityNow, later, 'claude-sonnet-5-5-low');
+  assert.deepEqual([idleThirdParty.state, idleThirdParty.resetAt, idleThirdParty.usedPercent], ['idle', null, 0]);
+
+  // A started 0%-used window keeps a fixed reset_time.
+  const startedZero = normalizeAntigravityUsage(antigravityResult(), antigravityNow, antigravityResult(), 'gpt-oss-120b-medium');
+  assert.deepEqual([startedZero.state, startedZero.resetAt], ['active', '2026-11-25T10:49:53.000Z']);
+
+  // Near-exhausted weekly quota (99.99% used) does not block; 0 remaining does.
+  const nearlyFull = antigravityResult({ geminiWeekly: { remaining: 0.0001, reset: '2026-12-02T04:52:39Z' } });
+  assert.equal(normalizeAntigravityUsage(nearlyFull, antigravityNow).state, 'active');
+  const blocked = antigravityResult({ geminiWeekly: { remaining: 0, reset: '2026-12-02T04:52:39Z' } });
+  assert.deepEqual([normalizeAntigravityUsage(blocked, antigravityNow).state, normalizeAntigravityUsage(blocked, antigravityNow).resetAt], ['blocked', '2026-12-02T04:52:39.000Z']);
+
+  // Weekly-only plan tiers use the weekly bucket rather than failing into a 5h timer.
+  const weeklyOnly = antigravityResult();
+  weeklyOnly.command.data.groups[0].buckets = [weeklyOnly.command.data.groups[0].buckets[0]];
+  assert.equal(normalizeAntigravityUsage(weeklyOnly, antigravityNow).resetAt, '2026-12-02T04:52:39.000Z');
+
+  for (const invalid of [
+    { ...antigravityResult(), status: 'ERROR' },
+    { ...antigravityResult(), num_turns: 1 },
+    { ...antigravityResult(), usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 } },
+    { ...antigravityResult(), command: { name: 'model', data: { groups: [] } } },
+    antigravityResult({ gemini5h: { remaining: -0.1, reset: '2026-11-25T09:52:39Z' } }),
+    antigravityResult({ gemini5h: { remaining: 0.5, reset: 'not-a-date' } }),
+    antigravityResult({ gemini5h: { remaining: 0.5, reset: null } }),
+  ]) {
+    assert.throws(() => normalizeAntigravityUsage(invalid, antigravityNow));
+  }
+});
+
+test('Antigravity reads active windows once, rechecks unused windows, and hides subprocess output on error', async () => {
+  const agy = { name: 'antigravity', executable: '/unused/agy', model: 'gemini-4-hydrogen-low' };
+  let activeCalls = 0; let waits = 0;
+  const activeReading = await readAntigravityUsage(agy, {
+    now: antigravityNow,
+    wait: async () => { waits++; },
+    runner: async () => { activeCalls++; return { code: 0, stdout: JSON.stringify(antigravityResult()) }; },
+  });
+  assert.equal(activeCalls, 1);
+  assert.equal(waits, 0);
+  assert.equal(activeReading.state, 'active');
+
+  let idleCalls = 0;
+  const idleReading = await readAntigravityUsage({ ...agy, model: 'claude-sonnet-5-5-low' }, {
+    now: antigravityNow,
+    wait: async () => { waits++; },
+    runner: async () => {
+      idleCalls++;
+      const reset = idleCalls === 1 ? '2026-11-25T10:49:53Z' : '2026-11-25T10:49:55Z';
+      return { code: 0, stdout: JSON.stringify(antigravityResult({ thirdParty5h: { remaining: 1, reset } })) };
+    },
+  });
+  assert.equal(idleCalls, 2);
+  assert.equal(waits, 1);
+  assert.equal(idleReading.state, 'idle');
+
+  for (const response of [{ code: 1, stdout: 'secret token' }, { code: 0, timedOut: true }, { code: 0, outputTooLarge: true }, { code: 0, stdout: 'secret token' }]) {
+    await assert.rejects(readAntigravityUsage(agy, { runner: async () => response }), error => !error.message.includes('secret token'));
+  }
+
+  // Since agy rejects fake model names upfront, a future CLI that turned /usage
+  // into a real prompt must trigger a 7-day backoff instead of retrying every 5m.
+  const state = {};
+  const modelTurn = { ...antigravityResult(), command: undefined, num_turns: 1, usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } };
+  const ready = await prepareScheduled(agy, {}, state, {
+    now: antigravityNow, boot: 'boot-1',
+    usageReader: () => readAntigravityUsage(agy, { now: antigravityNow, runner: async () => ({ code: 0, stdout: JSON.stringify(modelTurn) }) }),
+  });
+  assert.equal(ready, false);
+  assert.equal(state.usageRetryAt, stamp(antigravityNow + 7 * 24 * 60 * 60 * 1000));
+  let retries = 0;
+  assert.equal(await prepareScheduled(agy, {}, state, { now: antigravityNow + 60 * 60 * 1000, boot: 'boot-1', usageReader: async () => { retries++; return idle; } }), false);
+  assert.equal(retries, 0);
 });
 
 test('Claude subprocess errors, invalid JSON, and model responses become unknown usage without logging output', async () => {

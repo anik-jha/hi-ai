@@ -4,16 +4,16 @@
 
 [Source](https://github.com/anik-jha/hi-ai) · [Issues](https://github.com/anik-jha/hi-ai/issues) · [MIT license](LICENSE)
 
-A small, usage-aware utility for **Claude Code and Codex**, on macOS and Linux. Install it once, choose your providers, and let it follow their actual usage windows.
+A small, usage-aware utility for **Claude Code, Codex, and Antigravity**, on macOS and Linux. Install it once, choose your providers, and let it follow their actual usage windows.
 
 - **No active window:** send a minimal hello to start one.
 - **An active window:** save the provider's reported reset time and send the next hello when that time arrives.
 - **After a restart:** read usage again before deciding, rather than blindly starting another five-hour timer.
 - **Usage unavailable:** retry first; after three consecutive failures, use a five-hour timer until usage reads recover.
 
-HiAI uses lightweight models by default: Claude's `haiku` alias and Codex's `gpt-6-luna`. It has no npm runtime dependencies, GUI, or HiAI account.
+HiAI uses lightweight models by default: Claude's `haiku` alias, Codex's `gpt-6-luna`, and Antigravity's `gemini-4-hydrogen-low`. It has no npm runtime dependencies, GUI, or HiAI account.
 
-**Release status: 0.1.1.** Usage readers, timing decisions, failure recovery, and native schedulers have tests. Live usage reads, background delivery, and the idle → hello → newly active window transition have been observed on real accounts on macOS; see [Validation](#validation) for what is and is not covered. A hello consumes usage; the provider controls quota and billing.
+**Release status: 0.2.0.** Usage readers, timing decisions, failure recovery, and native schedulers have tests. Live usage reads, background delivery, and the idle → hello → newly active window transition have been observed on real accounts on macOS; see [Validation](#validation) for what is and is not covered. A hello consumes usage; the provider controls quota and billing.
 
 ## Install
 
@@ -21,21 +21,22 @@ Requires **Node.js 22+** and the selected provider CLIs, signed into your subscr
 
 - [Claude Code](https://code.claude.com/docs/en/overview): `claude auth login`.
 - [Standalone Codex CLI](https://learn.chatgpt.com/docs/cli): `codex login`. HiAI skips copies inside versioned IDE extension folders.
+- [Google Antigravity CLI](https://antigravity.google/docs/getting-started): sign in once with `agy`. HiAI searches `PATH` first and falls back to `~/.gemini/bin/agy` and `~/.local/bin/agy`. Antigravity is verified on macOS; Linux `cron` support with real credentials is unverified because `agy` stores personal OAuth tokens in the OS keyring (which requires an active D-Bus keyring session or Application Default Credentials under `cron`).
 - On Linux: `crontab` and a running cron service. Debian/Ubuntu: `sudo apt install cron && sudo systemctl enable --now cron`.
 
 ```sh
 npm install -g hi-ai-cli
-hi-ai setup --providers claude,codex
+hi-ai setup --providers claude,codex,antigravity
 ```
 
 Setup detects CLI paths and installs a user schedule. The first automatic usage check normally runs within about a minute. It sends a hello only if the provider is idle; an existing window is allowed to reach its reported reset time first.
 
-Use `--providers claude` or `--providers codex` for just one. Without `--providers`, setup offers the detected CLIs interactively.
+Use `--providers claude`, `--providers codex`, or `--providers antigravity` (`agy` is accepted as an alias) for any subset. Without `--providers`, setup offers the detected CLIs interactively.
 
 To delay the first automatic check:
 
 ```sh
-hi-ai setup --time 06:00 --providers claude,codex
+hi-ai setup --time 06:00 --providers claude,codex,antigravity
 ```
 
 `--time` means the next occurrence of that local time. Subsequent hellos follow provider resets.
@@ -51,7 +52,7 @@ A cron expression such as `0 */5 * * *` runs at 00:00, 05:00, 10:00, 15:00, and 
 | Avoid an unnecessary startup hello | Check whether a usage window is already active. |
 | Align with existing usage | Save the reset time returned by the provider. |
 | Recover after restart | Refresh usage for the current boot before deciding. |
-| Run both providers | Independent usage state, models, and deadlines. |
+| Run multiple providers | Independent usage state, models, and deadlines. |
 | Confirm delivery | Validate structured CLI responses before recording success. |
 | Prevent overlapping calls | Share a lock across scheduled runs, manual runs, and settings changes. |
 | Handle uncertainty | Apply timeouts, request backoff, and delivery cooldowns. |
@@ -74,8 +75,9 @@ npm uninstall -g hi-ai-cli
 Change providers or models by rerunning setup:
 
 ```sh
-hi-ai setup --providers claude,codex \
-  --claude-model haiku --codex-model gpt-6-luna
+hi-ai setup --providers claude,codex,antigravity \
+  --claude-model haiku --codex-model gpt-6-luna \
+  --antigravity-model gemini-4-hydrogen-low
 ```
 
 Model access depends on your account. There is no automatic fallback to a more expensive model. Recent CLIs are required for the flags used here; see the validation notes below.
@@ -104,9 +106,11 @@ The command uses a deliberately invalid model name, so a CLI that stops recogniz
 
 **Codex:** HiAI starts the installed CLI's app server and calls the documented [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server) method. It creates no thread or inference turn and does not parse Codex credential files. An idle Codex account reports an unused window whose reset time moves forward with every read, while a started window keeps a fixed reset. When the window is unused, HiAI reads twice, two seconds apart, and treats a moving reset as idle.
 
-Custom `CLAUDE_CONFIG_DIR` and `CODEX_HOME` paths are retained by setup. Inherited API-key variables are removed from subprocesses to prefer saved subscription logins; check that your CLIs use the intended account.
+**Antigravity:** HiAI runs the installed, unmodified `agy -p /usage --output-format json` command with session-only settings (`--settings`) and requires a local `usage` command response with zero turns and zero tokens. Unlike Claude Code, `agy` rejects unknown `--model` names before running local slash commands, so an invalid-model guard cannot be used; if a future CLI ever turns `/usage` into a model request (`num_turns > 0`, nonzero tokens, or a non-`usage` command), HiAI rejects the reading and pauses Antigravity usage checks for seven days rather than retrying every five minutes. Antigravity owns keyring sign-in and credential refresh; HiAI does not read keyring entries or credential files. Antigravity groups quota into `Gemini Models` and `Claude and GPT models`, each with five-hour and weekly buckets; HiAI selects the quota group matching `--antigravity-model` (falling back to the weekly bucket on weekly-only plans). Like Codex, an unused Antigravity bucket reports `remaining_fraction: 1` with a reset time that advances on each read, so HiAI rechecks two seconds later when `remaining_fraction` is `1`.
 
-Hellos run in a temporary empty directory. Claude tools, MCP servers, and user hooks are disabled for the invocation. Codex ignores user config for the hello and uses its read-only sandbox. Sessions are ephemeral. Provider output is inspected in memory, not saved to the log.
+Custom `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, Linux D-Bus/runtime (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`), and Antigravity ADC (`AGY_ADC_AUTH`, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`) variables are retained by setup when present. Inherited API-key variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`) are removed from subprocesses to prefer saved subscription logins; check that your CLIs use the intended account.
+
+Hellos run in a temporary empty directory. Claude tools, MCP servers, and user hooks are disabled for the invocation. Codex ignores user config for the hello and uses its read-only sandbox. Antigravity disables slash commands, enables its sandbox, enforces `strict` tool permissions (which headless print mode soft-denies without executing), and disables paid AI credit overages (`useG1Credits: false`) for the invocation. Provider output is inspected in memory, not saved to the log.
 
 Settings, sanitized quota observations, deadlines, the latest scheduler heartbeat, and the latest 100 result records live in `~/.hi-ai/`. Logs contain confirmation/process metadata, not provider output or credentials. `HI_AI_HOME` overrides this directory.
 
@@ -143,13 +147,12 @@ HI_AI_LIVE_TEST=1 npm run test:live:scheduled
 
 ## Validation
 
-Verified on one Mac with Claude Code 2.1.311 and standalone Codex CLI 0.167.1: live background hello delivery and live usage reads for both providers. A real scheduled startup detected both active windows, saved their reported reset times, and sent no early hellos.
+Verified on one Mac with Claude Code 2.1.311, standalone Codex CLI 0.167.1, and Antigravity CLI 1.5.16:
 
-The idle → hello → newly active window transition was observed on real accounts on 2026-11-12. Codex was read as idle, received a hello, and then reported an active window with a fixed reset five hours later. Claude was followed through a reported reset: the reader showed the window as active until its reset time and as idle immediately afterwards, HiAI sent one hello at the saved deadline, and the next reading showed a new active window with a reported reset.
+- **Claude Code and Codex:** live background hello delivery, live usage reads, and a real scheduled `launchd` startup that detected active windows, saved their reported reset times, and sent no early hellos. On 2026-11-12, both were followed through the full idle → hello → newly active window transition on live accounts.
+- **Antigravity:** live zero-inference `agy -p /usage --output-format json` reads across both quota groups (`Gemini Models` active with a fixed five-hour reset, `Claude and GPT models` idle with an advancing reset), a sandboxed scheduled check under `launchd`-equivalent environment variables that latched the active Gemini reset without sending early, a confirmed live `gemini-4-hydrogen-low` hello on macOS, and `0.1.1` → `0.2.0` config compatibility.
 
-On Linux, the full suite and the Docker real-cron test have passed on Ubuntu 24.04 (aarch64) with Node 22, using stand-in provider CLIs.
-
-Other remaining checks are a complete five-hour soak, a physical sleep/reboot cycle, live authenticated Linux CLIs, and a minimum supported CLI version range. Passing scheduler tests or a hello response does not prove that a provider replenishes quota.
+On Linux, the unit suite and the Docker real-cron test passed in `0.1.1` on Ubuntu 24.04 (aarch64) with Node 22 using stand-in provider CLIs. Not yet verified for `0.2.0`: a live `launchd` tick and full idle → hello → active reset cycle on Antigravity, re-running `npm run test:docker` with the three-provider fixture, and live authenticated CLIs on Linux (particularly Antigravity under `cron`, where keyring access without a desktop D-Bus session or ADC is untested). Passing scheduler tests or a hello response does not prove that a provider replenishes quota.
 
 HiAI delegates authentication to the unmodified Claude Code binary, following the boundary in Anthropic’s [authentication and credential-use rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). Anthropic also [documents scripted CLI usage](https://code.claude.com/docs/en/headless). Provider terms and plan rules apply.
 
