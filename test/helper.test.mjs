@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
-import { deliveryConfirmed, execute, FIVE_HOURS_MS, RETRY_DELAY_MS, firstStart, nextDueAt, validateTime } from '../lib/core.mjs';
+import { captureAuthPaths, deliveryConfirmed, execute, FIVE_HOURS_MS, RETRY_DELAY_MS, firstStart, nextDueAt, validateTime } from '../lib/core.mjs';
 import { cronText, nodeExecutable, plistText, stripCron } from '../lib/scheduler.mjs';
 import { bootId } from '../lib/usage.mjs';
 
@@ -26,9 +26,11 @@ async function fixture(t) {
     CLAUDE_CONFIG_DIR: path.join(directory, 'claude'), CODEX_HOME: path.join(directory, 'codex'),
     OPENAI_API_KEY: 'test-only', CODEX_API_KEY: 'test-only',
     ANTHROPIC_API_KEY: 'test-only', ANTHROPIC_AUTH_TOKEN: 'test-only',
+    GEMINI_API_KEY: 'test-only', GOOGLE_API_KEY: 'test-only',
+    SSH_CONNECTION: '', SSH_CLIENT: '', SSH_TTY: '', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '',
   };
   const writeScript = async (name, text) => fs.writeFile(path.join(bin, name), `#!/usr/bin/env node\n${text}`, { mode: 0o755 });
-  for (const name of ['claude', 'codex']) await writeScript(name, `
+  for (const [name, binary] of [['claude', 'claude'], ['codex', 'codex'], ['antigravity', 'agy']]) await writeScript(binary, `
 const fs = require('node:fs');
 if (process.env.SLOW_PROVIDER === ${JSON.stringify(name)}) {
   fs.writeFileSync(process.env.FIXTURE + '/provider.pid', String(process.pid));
@@ -36,10 +38,12 @@ if (process.env.SLOW_PROVIDER === ${JSON.stringify(name)}) {
 }
 fs.appendFileSync(process.env.FIXTURE + '/calls', JSON.stringify({
   name: ${JSON.stringify(name)}, args: process.argv.slice(2), cwd: process.cwd(),
-  apiKeyPresent: ['OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN'].some(k => k in process.env)
+  apiKeyPresent: ['OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','GEMINI_API_KEY','GOOGLE_API_KEY'].some(k => k in process.env),
+  authEnv: Object.fromEntries(['XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS','AGY_ADC_AUTH','AGY_CLI_FORCE_FILE_TOKEN_STORAGE','GOOGLE_APPLICATION_CREDENTIALS','CLOUDSDK_CONFIG'].map(k => [k, process.env[k] ?? null]))
 }) + '\\n');
 if (process.env.BAD_OUTPUT !== ${JSON.stringify(name)}) {
   if (${JSON.stringify(name)} === 'claude') console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'hi'}));
+  else if (${JSON.stringify(name)} === 'antigravity') console.log(JSON.stringify({conversation_id:'c1',status:'SUCCESS',response:'hi'}));
   else {
     console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'hi'}}));
     console.log(JSON.stringify({type:'turn.completed'}));
@@ -320,6 +324,12 @@ test('delivery requires a successful structured response, not just exit zero', (
   assert.equal(deliveryConfirmed('codex', completed), false);
   assert.equal(deliveryConfirmed('codex', message), false);
   assert.equal(deliveryConfirmed('codex', `${message}\n${JSON.stringify({ type: 'turn.failed' })}\n${completed}`), false);
+  const agy = { conversation_id: 'c1', status: 'SUCCESS', response: 'hi' };
+  assert.equal(deliveryConfirmed('antigravity', JSON.stringify(agy)), true);
+  for (const bad of [{ ...agy, status: 'ERROR' }, { ...agy, error: 'failed' }, { ...agy, response: '   ' }]) {
+    assert.equal(deliveryConfirmed('antigravity', JSON.stringify(bad)), false);
+  }
+  assert.equal(deliveryConfirmed('antigravity', 'not json'), false);
 });
 
 test('an unconfirmed zero-exit response is not marked sent or immediately repeated', async t => {
@@ -398,12 +408,12 @@ test('SIGTERM during a usage check cleans up and is not counted as a failed usag
   assert.equal(f.call(['setup', '--providers', 'claude,codex']).status, 0);
   // Remove the fixture's idle readings so the scheduled run reads usage itself.
   await fs.rm(path.join(f.env.HI_AI_HOME, 'state.json'));
-  for (const provider of ['claude', 'codex']) {
+  for (const [provider, binary] of [['claude', 'claude'], ['codex', 'codex'], ['antigravity', 'agy']]) {
     await fs.rm(path.join(f.directory, 'provider.pid'), { force: true });
     await fs.rm(path.join(f.directory, 'tmp'), { recursive: true, force: true });
     await fs.writeFile(path.join(f.env.HI_AI_HOME, 'config.json'), JSON.stringify({
       ...JSON.parse(await fs.readFile(path.join(f.env.HI_AI_HOME, 'config.json'), 'utf8')),
-      providers: [{ name: provider, executable: path.join(f.directory, 'bin', provider), model: 'test-model' }],
+      providers: [{ name: provider, executable: path.join(f.directory, 'bin', binary), model: 'test-model' }],
     }));
     const state = await interrupt(f, 'SIGTERM', { SLOW_PROVIDER: provider });
     assert.deepEqual(state[provider] ?? {}, {}, `${provider} records no usage failure or delivery attempt`);
@@ -594,4 +604,83 @@ test('PATH discovery skips the versioned Codex binary bundled inside the IDE ext
   `], { cwd: root, env: { ...process.env, PATH: `${extension}${path.delimiter}${standalone}` }, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), path.join(standalone, 'codex'));
+});
+
+test('Antigravity supports the agy alias, isolates hello flags, and discovers ~/.gemini/bin/agy when off PATH', async t => {
+  const f = await fixture(t);
+  const setup = f.call(['setup', '--providers', 'agy', '--antigravity-model', 'gemini-4-hydrogen-low']);
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.match(setup.stdout, /antigravity \(gemini-4-hydrogen-low\)/);
+  const preview = f.call(['run', '--dry-run']);
+  assert.equal(preview.status, 0, preview.stderr);
+  const previewArgs = JSON.parse(preview.stdout.trim());
+  assert.ok(previewArgs.includes('--disable-slash-commands'));
+  assert.ok(previewArgs.includes('--sandbox'));
+  const settings = JSON.parse(previewArgs[previewArgs.indexOf('--settings') + 1]);
+  assert.equal(settings.toolPermission, 'strict');
+  assert.equal(settings.useG1Credits, false);
+  assert.equal(f.call(['run', '--scheduled']).status, 0);
+  const calls = await f.calls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'antigravity');
+  assert.equal(calls[0].apiKeyPresent, false);
+
+  const fallbackHome = await fs.mkdtemp(path.join(os.tmpdir(), 'hi-ai-agy-home-'));
+  t.after(() => fs.rm(fallbackHome, { recursive: true, force: true }));
+  const geminiBin = path.join(fallbackHome, '.gemini', 'bin');
+  await fs.mkdir(geminiBin, { recursive: true });
+  const fallbackAgy = path.join(geminiBin, 'agy');
+  await fs.writeFile(fallbackAgy, '#!/bin/sh\nexit 0', { mode: 0o755 });
+  const lookup = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import {findExecutable} from './lib/core.mjs';
+    console.log(await findExecutable('antigravity'));
+  `], { cwd: root, env: { ...process.env, HOME: fallbackHome, PATH: '' }, encoding: 'utf8' });
+  assert.equal(lookup.status, 0, lookup.stderr);
+  assert.equal(lookup.stdout.trim(), fallbackAgy);
+});
+
+test('Antigravity auth and session env vars propagate to cron runs without clobbering a live session', async t => {
+  const f = await fixture(t);
+  const setupEnv = {
+    XDG_RUNTIME_DIR: '/run/user/1000',
+    DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus-old',
+    AGY_ADC_AUTH: '1',
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE: null,
+    GOOGLE_APPLICATION_CREDENTIALS: '/tmp/adc.json',
+    CLOUDSDK_CONFIG: '/tmp/gcloud',
+  };
+  assert.equal(f.call(['setup', '--providers', 'antigravity'], { ...setupEnv, AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' }).status, 0);
+
+  // Under a bare cron environment (no session vars), saved values are restored.
+  assert.equal(f.call(['run'], { XDG_RUNTIME_DIR: '', DBUS_SESSION_BUS_ADDRESS: '', AGY_ADC_AUTH: '', GOOGLE_APPLICATION_CREDENTIALS: '', CLOUDSDK_CONFIG: '' }).status, 0);
+  // In a newer live desktop session, current D-Bus/runtime vars take precedence.
+  assert.equal(f.call(['run'], { XDG_RUNTIME_DIR: '/run/user/2000', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/2000/bus-new' }).status, 0);
+
+  // Linux SSH setup automatically forces file-based token storage for bare cron runs.
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'linux'), { AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '1' });
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'darwin'), {});
+  assert.deepEqual(captureAuthPaths([{ name: 'claude' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'linux'), {});
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_TTY: '/dev/pts/1', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '0' }, 'linux'), { AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '0' });
+
+  if (process.platform === 'linux') {
+    assert.equal(f.call(['setup', '--providers', 'antigravity'], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }).status, 0);
+    assert.equal(f.call(['run'], { SSH_CONNECTION: '', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' }).status, 0);
+  }
+
+  const calls = await f.calls();
+  assert.deepEqual(calls[0].authEnv, { ...setupEnv, AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' });
+  assert.equal(calls[1].authEnv.XDG_RUNTIME_DIR, '/run/user/2000');
+  assert.equal(calls[1].authEnv.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/run/user/2000/bus-new');
+  assert.equal(calls[1].authEnv.AGY_ADC_AUTH, '1');
+  if (process.platform === 'linux') assert.equal(calls[2].authEnv.AGY_CLI_FORCE_FILE_TOKEN_STORAGE, '1');
+
+  // Status surfaces a paused usage-retry window even before the first usage read.
+  const statePath = path.join(f.env.HI_AI_HOME, 'state.json');
+  const retryAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  await fs.writeFile(statePath, JSON.stringify({
+    antigravity: { usageError: 'antigravity usage check unavailable: pausing checks.', usageRetryAt: retryAt },
+  }));
+  const status = f.call(['status']);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /after usage check retry \(/);
 });

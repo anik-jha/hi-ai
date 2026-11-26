@@ -2,13 +2,14 @@
 import * as fs from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
-import { acquireLock, config, defaults, file, findExecutable, firstStart, home, Interrupted, nextDueAt, readJSON, readState, run, writeJSON } from '../lib/core.mjs';
+import { acquireLock, captureAuthPaths, config, defaults, file, findExecutable, firstStart, home, Interrupted, nextDueAt, readJSON, readState, run, writeJSON } from '../lib/core.mjs';
 import * as scheduler from '../lib/scheduler.mjs';
 
-const help = `hi-ai — a tiny scheduled hello for Claude Code and Codex
+const help = `hi-ai — a tiny scheduled hello for Claude Code, Codex, and Antigravity
 
-  setup [--time HH:MM] [--providers claude,codex]
+  setup [--time HH:MM] [--providers claude,codex,antigravity]
         [--claude-model haiku] [--codex-model gpt-6-luna]
+        [--antigravity-model gemini-4-hydrogen-low]
   run [--dry-run]       Send one hello now, or preview the CLI arguments
   status               Show the schedule and last results
   pause                Remove the schedule; keep settings
@@ -22,12 +23,14 @@ Requires Node.js 22+, a logged-in provider CLI, and cron on Linux.
 Pings consume usage; they cannot force a quota reset.
 `;
 
+const providerAlias = name => name === 'agy' ? 'antigravity' : name;
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
       time: { type: 'string' }, providers: { type: 'string' },
-      'claude-model': { type: 'string' }, 'codex-model': { type: 'string' },
+      'claude-model': { type: 'string' }, 'codex-model': { type: 'string' }, 'antigravity-model': { type: 'string' },
       'dry-run': { type: 'boolean' }, scheduled: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
     },
@@ -36,7 +39,7 @@ async function main() {
   if (values.help || !positionals.length) { console.log(help); return; }
   if (positionals.length !== 1) throw new Error('Expected one command. See hi-ai --help.');
   const action = positionals[0];
-  const allowed = action === 'setup' ? ['time', 'providers', 'claude-model', 'codex-model']
+  const allowed = action === 'setup' ? ['time', 'providers', 'claude-model', 'codex-model', 'antigravity-model']
     : action === 'run' ? ['dry-run', 'scheduled'] : [];
   for (const key of Object.keys(values)) if (!allowed.includes(key)) throw new Error(`--${key} is not valid for ${action}.`);
 
@@ -63,18 +66,18 @@ async function main() {
         } finally { reader.close(); }
       }
       const firstAt = firstStart(time);
-      const selected = names === undefined || names === '' ? detected.map(p => p.name) : [...new Set(names.split(',').map(name => name.trim()))];
-      if (!selected.length) throw new Error('No provider CLIs found on PATH. Install Claude Code or Codex and log in first.');
+      const selected = names === undefined || names === '' ? detected.map(p => p.name) : [...new Set(names.split(',').map(name => providerAlias(name.trim())))];
+      if (!selected.length) throw new Error('No provider CLIs found on PATH. Install Claude Code, Codex, or Antigravity CLI and log in first.');
       const providers = selected.map(name => {
-        if (!Object.hasOwn(defaults, name)) throw new Error(`Unknown provider: ${name}. Choose claude,codex.`);
+        if (!Object.hasOwn(defaults, name)) throw new Error(`Unknown provider: ${name}. Choose claude,codex,antigravity.`);
         const executable = detected.find(p => p.name === name)?.executable;
-        if (!executable) throw new Error(`${name} is not on PATH. Install it and log in first.`);
+        if (!executable) throw new Error(`${name === 'antigravity' ? 'antigravity (agy)' : name} is not on PATH. Install it and log in first.`);
         const model = values[`${name}-model`] ?? previous?.providers.find(p => p.name === name)?.model ?? defaults[name];
         if (!model.trim() || model.startsWith('-')) throw new Error(`Invalid ${name} model.`);
         return { name, executable, model };
       });
       const runtime = await scheduler.runtime();
-      const authPaths = Object.fromEntries(['CODEX_HOME', 'CLAUDE_CONFIG_DIR'].filter(key => process.env[key]).map(key => [key, process.env[key]]));
+      const authPaths = captureAuthPaths(providers);
       const next = { firstAt, providers, path: process.env.PATH, authPaths, enabled: true, scheduler: { ...runtime, installedAt: new Date().toISOString() } };
       await writeJSON('config.json', next);
       try { await scheduler.install(undefined, runtime); }
@@ -110,7 +113,10 @@ async function main() {
         console.log(`  Usage: ${last?.usage ? `${last.usage.state} (${last.usage.usedPercent}% used)` : 'awaiting first usage check'}.`);
         if (last?.usageError) console.log(`  ${last.usageError}`);
         if (last?.usageFallback) console.log(`  Automatic mode: five-hour timer fallback (${last.usageFailures} consecutive usage checks failed).`);
-        console.log(`  Next hello: ${!last?.usage && !last?.lastSuccessAt ? 'after checking provider usage' : due <= Date.now() ? 'due now' : new Date(due).toLocaleString()}`);
+        const nextLabel = !last?.usage && !last?.lastSuccessAt
+          ? (Date.parse(last?.usageRetryAt) > Date.now() ? `after usage check retry (${new Date(due).toLocaleString()})` : 'after checking provider usage')
+          : due <= Date.now() ? 'due now' : new Date(due).toLocaleString();
+        console.log(`  Next hello: ${nextLabel}`);
       }
       console.log(`Settings and recent results: ${home()}`);
     } else if (action === 'pause') {

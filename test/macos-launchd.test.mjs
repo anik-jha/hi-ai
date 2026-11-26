@@ -29,12 +29,14 @@ test('macOS: real launchd waits for active windows, sends at reset, and distingu
   const marker = path.join(directory, 'sent');
   const failedLogin = path.join(directory, 'fail-claude');
   await fs.writeFile(failedLogin, 'simulate an expired Claude login');
-  for (const name of ['claude', 'codex']) {
+  for (const [name, binary] of [['claude', 'claude'], ['codex', 'codex'], ['antigravity', 'agy']]) {
     const response = name === 'claude'
       ? JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'hi' })
-      : [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'hi' } }), JSON.stringify({ type: 'turn.completed' })].join('\n');
+      : name === 'antigravity'
+        ? JSON.stringify({ conversation_id: 'c1', status: 'SUCCESS', response: 'hi' })
+        : [JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'hi' } }), JSON.stringify({ type: 'turn.completed' })].join('\n');
     const failure = name === 'claude' ? `if (fs.existsSync(${JSON.stringify(failedLogin)})) { console.log(JSON.stringify({type:'result',subtype:'error_during_execution',is_error:true})); process.exit(1); }` : '';
-    await fs.writeFile(path.join(bin, name), `#!/usr/bin/env node\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(marker)}, '${name}\\n');\n${failure}\nconsole.log(${JSON.stringify(response)});\n`, { mode: 0o755 });
+    await fs.writeFile(path.join(bin, binary), `#!/usr/bin/env node\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(marker)}, '${name}\\n');\n${failure}\nconsole.log(${JSON.stringify(response)});\n`, { mode: 0o755 });
   }
   const env = { ...process.env, HOME: directory, HI_AI_HOME: path.join(directory, 'settings'), PATH: `${bin}:${process.env.PATH}`, CLAUDE_CONFIG_DIR: path.join(directory, 'claude'), CODEX_HOME: path.join(directory, 'codex') };
   const call = args => spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8' });
@@ -43,11 +45,11 @@ test('macOS: real launchd waits for active windows, sends at reset, and distingu
     assert.equal(result.status, 0, result.stderr);
     await fs.rm(directory, { recursive: true, force: true });
   });
-  const setup = call(['setup', '--providers', 'claude,codex']);
+  const setup = call(['setup', '--providers', 'claude,codex,antigravity']);
   assert.equal(setup.status, 0, setup.stderr);
   const resetAt = new Date(Date.now() + 90_000).toISOString();
   const active = { state: 'active', resetAt, checkedAt: new Date().toISOString(), usedPercent: 20, source: 'fixture', boot: await bootId() };
-  await fs.writeFile(path.join(env.HI_AI_HOME, 'state.json'), JSON.stringify({ claude: { usage: active }, codex: { usage: active } }));
+  await fs.writeFile(path.join(env.HI_AI_HOME, 'state.json'), JSON.stringify({ claude: { usage: active }, codex: { usage: active }, antigravity: { usage: active } }));
   const settings = JSON.parse(await fs.readFile(path.join(env.HI_AI_HOME, 'config.json'), 'utf8'));
   assert.ok(!settings.scheduler.node.includes('/Cellar/') && !settings.scheduler.node.includes('/fnm_multishells/'));
   // Inject a controlled stable alias into the real job to simulate an upgrade.
@@ -67,20 +69,21 @@ test('macOS: real launchd waits for active windows, sends at reset, and distingu
   let latched;
   while (Date.now() < firstTick) {
     const state = JSON.parse(await fs.readFile(path.join(env.HI_AI_HOME, 'state.json'), 'utf8'));
-    if (state.claude.resetAt && state.codex.resetAt) { latched = state; break; }
+    if (state.claude.resetAt && state.codex.resetAt && state.antigravity.resetAt) { latched = state; break; }
     await setTimeout(500);
   }
   assert.equal(latched?.claude.resetAt, resetAt);
   assert.equal(latched?.codex.resetAt, resetAt);
+  assert.equal(latched?.antigravity.resetAt, resetAt);
   assert.equal(await fs.readFile(marker, 'utf8').catch(() => ''), '', 'an active window must not receive an early hello');
   const deadline = Date.now() + 100_000;
   while (Date.now() < deadline) {
     const messages = await fs.readFile(marker, 'utf8').catch(() => '');
     const running = await fs.access(path.join(env.HI_AI_HOME, 'run.lock')).then(() => true, () => false);
-    if (messages === 'claude\ncodex\n' && !running) break;
+    if (messages === 'claude\ncodex\nantigravity\n' && !running) break;
     await setTimeout(500);
   }
-  assert.equal(await fs.readFile(marker, 'utf8'), 'claude\ncodex\n');
+  assert.equal(await fs.readFile(marker, 'utf8'), 'claude\ncodex\nantigravity\n');
   const failureStatus = call(['status']);
   assert.match(failureStatus.stdout, /^Scheduled:/);
   assert.match(failureStatus.stdout, /provider failure/);
@@ -88,7 +91,7 @@ test('macOS: real launchd waits for active windows, sends at reset, and distingu
   assert.ok(!failureStatus.stdout.includes('Broken schedule'));
   assert.match(spawnSync('launchctl', ['print', service], { encoding: 'utf8' }).stdout, /last exit code = 0/);
   assert.equal(call(['run', '--scheduled']).status, 0);
-  assert.equal(await fs.readFile(marker, 'utf8'), 'claude\ncodex\n', 'both providers wait five more hours');
+  assert.equal(await fs.readFile(marker, 'utf8'), 'claude\ncodex\nantigravity\n', 'all providers wait five more hours');
   assert.equal(call(['pause']).status, 0);
   assert.notEqual(spawnSync('launchctl', ['print', service]).status, 0);
   assert.equal(call(['resume']).status, 0);
