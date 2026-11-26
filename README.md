@@ -147,13 +147,13 @@ Tested on live accounts, one machine per platform:
 
 | | macOS (`launchd`) | Linux (`cron`) |
 |---|---|---|
-| Claude Code | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hellos, full reset cycle |
-| Codex | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hello at reset |
-| Antigravity | Usage reads, manual hello | Usage reads, token renewal, manual hello |
+| Claude Code | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hello, full reset cycle |
+| Codex | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hello, full reset cycle |
+| Antigravity | Usage reads, manual hello | Usage reads, scheduled hello, full reset cycle, token renewal |
 
 macOS used Claude Code 2.1.311, Codex CLI 0.167.1, and Antigravity CLI 1.5.16. Linux (Ubuntu 24.04, aarch64, signed in over SSH) used Claude Code 2.1.322, Codex CLI 0.166.0, and Antigravity CLI 1.5.17.
 
-Not yet tested: an Antigravity hello sent by the scheduler on either platform, and Antigravity on a Linux desktop that keeps its sign-in in the keyring. A confirmed hello does not prove that a provider replenishes quota.
+Not yet tested: an Antigravity hello sent by the scheduler on macOS, and Antigravity on a Linux desktop that keeps its sign-in in the keyring. A confirmed hello does not prove that a provider replenishes quota.
 
 HiAI delegates authentication to the unmodified Claude Code binary, following the boundary in Anthropic’s [authentication and credential-use rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). Anthropic also [documents scripted CLI usage](https://code.claude.com/docs/en/headless). Provider terms and plan rules apply.
 
