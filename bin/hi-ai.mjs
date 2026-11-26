@@ -2,7 +2,7 @@
 import * as fs from 'node:fs/promises';
 import { parseArgs } from 'node:util';
 import { createInterface } from 'node:readline/promises';
-import { acquireLock, AUTH_ENV_KEYS, config, defaults, file, findExecutable, firstStart, home, Interrupted, nextDueAt, readJSON, readState, run, writeJSON } from '../lib/core.mjs';
+import { acquireLock, captureAuthPaths, config, defaults, file, findExecutable, firstStart, home, Interrupted, nextDueAt, readJSON, readState, run, writeJSON } from '../lib/core.mjs';
 import * as scheduler from '../lib/scheduler.mjs';
 
 const help = `hi-ai — a tiny scheduled hello for Claude Code, Codex, and Antigravity
@@ -77,7 +77,7 @@ async function main() {
         return { name, executable, model };
       });
       const runtime = await scheduler.runtime();
-      const authPaths = Object.fromEntries(AUTH_ENV_KEYS.filter(key => process.env[key]).map(key => [key, process.env[key]]));
+      const authPaths = captureAuthPaths(providers);
       const next = { firstAt, providers, path: process.env.PATH, authPaths, enabled: true, scheduler: { ...runtime, installedAt: new Date().toISOString() } };
       await writeJSON('config.json', next);
       try { await scheduler.install(undefined, runtime); }
@@ -113,7 +113,10 @@ async function main() {
         console.log(`  Usage: ${last?.usage ? `${last.usage.state} (${last.usage.usedPercent}% used)` : 'awaiting first usage check'}.`);
         if (last?.usageError) console.log(`  ${last.usageError}`);
         if (last?.usageFallback) console.log(`  Automatic mode: five-hour timer fallback (${last.usageFailures} consecutive usage checks failed).`);
-        console.log(`  Next hello: ${!last?.usage && !last?.lastSuccessAt ? 'after checking provider usage' : due <= Date.now() ? 'due now' : new Date(due).toLocaleString()}`);
+        const nextLabel = !last?.usage && !last?.lastSuccessAt
+          ? (Date.parse(last?.usageRetryAt) > Date.now() ? `after usage check retry (${new Date(due).toLocaleString()})` : 'after checking provider usage')
+          : due <= Date.now() ? 'due now' : new Date(due).toLocaleString();
+        console.log(`  Next hello: ${nextLabel}`);
       }
       console.log(`Settings and recent results: ${home()}`);
     } else if (action === 'pause') {

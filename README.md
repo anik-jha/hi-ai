@@ -21,7 +21,7 @@ Requires **Node.js 22+** and the selected provider CLIs, signed into your subscr
 
 - [Claude Code](https://code.claude.com/docs/en/overview): `claude auth login`.
 - [Standalone Codex CLI](https://learn.chatgpt.com/docs/cli): `codex login`. HiAI skips copies inside versioned IDE extension folders.
-- [Google Antigravity CLI](https://antigravity.google/docs/getting-started): sign in once with `agy`. HiAI searches `PATH` first and falls back to `~/.gemini/bin/agy` and `~/.local/bin/agy`. Antigravity is verified on macOS; Linux `cron` support with real credentials is unverified because `agy` stores personal OAuth tokens in the OS keyring (which requires an active D-Bus keyring session or Application Default Credentials under `cron`).
+- [Google Antigravity CLI](https://antigravity.google/docs/getting-started): sign in once with `agy`. HiAI searches `PATH` first and falls back to `~/.gemini/bin/agy` and `~/.local/bin/agy`. On Linux, `agy` uses the OS keyring on desktop sessions and file-based token storage over SSH (which `hi-ai setup` preserves for `cron` via `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1`).
 - On Linux: `crontab` and a running cron service. Debian/Ubuntu: `sudo apt install cron && sudo systemctl enable --now cron`.
 
 ```sh
@@ -43,7 +43,7 @@ hi-ai setup --time 06:00 --providers claude,codex,antigravity
 
 ## Why use HiAI instead of a cron command?
 
-Cron can launch a command. HiAI adds the account-state and recovery logic around that command, with one setup for both providers and the same management commands on macOS and Linux.
+Cron can launch a command. HiAI adds the account-state and recovery logic around that command, with one setup for all three providers and the same management commands on macOS and Linux.
 
 A cron expression such as `0 */5 * * *` runs at 00:00, 05:00, 10:00, 15:00, and 20:00, with only four hours between 20:00 and midnight. It also has no connection to a window you started manually at another time. HiAI reads that window and uses its reported reset instead.
 
@@ -106,9 +106,9 @@ The command uses a deliberately invalid model name, so a CLI that stops recogniz
 
 **Codex:** HiAI starts the installed CLI's app server and calls the documented [`account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server) method. It creates no thread or inference turn and does not parse Codex credential files. An idle Codex account reports an unused window whose reset time moves forward with every read, while a started window keeps a fixed reset. When the window is unused, HiAI reads twice, two seconds apart, and treats a moving reset as idle.
 
-**Antigravity:** HiAI runs the installed, unmodified `agy -p /usage --output-format json` command with session-only settings (`--settings`) and requires a local `usage` command response with zero turns and zero tokens. Unlike Claude Code, `agy` rejects unknown `--model` names before running local slash commands, so an invalid-model guard cannot be used; if a future CLI ever turns `/usage` into a model request (`num_turns > 0`, nonzero tokens, or a non-`usage` command), HiAI rejects the reading and pauses Antigravity usage checks for seven days rather than retrying every five minutes. Antigravity owns keyring sign-in and credential refresh; HiAI does not read keyring entries or credential files. Antigravity groups quota into `Gemini Models` and `Claude and GPT models`, each with five-hour and weekly buckets; HiAI selects the quota group matching `--antigravity-model` (falling back to the weekly bucket on weekly-only plans). Like Codex, an unused Antigravity bucket reports `remaining_fraction: 1` with a reset time that advances on each read, so HiAI rechecks two seconds later when `remaining_fraction` is `1`.
+**Antigravity:** HiAI runs the installed, unmodified `agy -p /usage --output-format json` command with session-only settings (`--settings`) and requires a local `usage` command response with zero turns and zero tokens. Unlike Claude Code, `agy` rejects unknown `--model` names before running local slash commands, so an invalid-model guard cannot be used; if a future CLI ever turns `/usage` into a model request (`num_turns > 0` or any nonzero token count), HiAI rejects the reading and pauses scheduled Antigravity usage checks and hellos for seven days rather than retrying every five minutes. A reply that only changes format, with zero turns and zero tokens, counts as an ordinary failed read. Antigravity owns sign-in and credential refresh; HiAI does not read keyring entries or credential files. Antigravity groups quota into `Gemini Models` and `Claude and GPT models`, each with five-hour and weekly buckets; HiAI selects the quota group matching `--antigravity-model` (falling back to the weekly bucket on weekly-only plans). Like Codex, an unused Antigravity bucket reports `remaining_fraction: 1` with a reset time that advances on each read, so HiAI rechecks two seconds later when `remaining_fraction` is `1`. An unused bucket can instead report the zero timestamp (`1970-01-01T00:00:00Z`) as its reset, which HiAI reads as idle without a recheck.
 
-Custom `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, Linux D-Bus/runtime (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`), and Antigravity ADC (`AGY_ADC_AUTH`, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`) variables are retained by setup when present. Inherited API-key variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`) are removed from subprocesses to prefer saved subscription logins; check that your CLIs use the intended account.
+Custom `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, Linux D-Bus/runtime (`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`), and Antigravity auth/storage (`AGY_ADC_AUTH`, `AGY_CLI_FORCE_FILE_TOKEN_STORAGE`, `GOOGLE_APPLICATION_CREDENTIALS`, `CLOUDSDK_CONFIG`) variables are retained by setup when present. Linux SSH setups automatically record `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` so `cron` reads the same file-based token store as SSH sign-in; if you signed in on a Linux desktop (keyring) and later run `setup` over SSH, prefix `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=0` to keep keyring mode. Inherited API-key variables (`OPENAI_API_KEY`, `CODEX_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`) are removed from subprocesses to prefer saved subscription logins; check that your CLIs use the intended account.
 
 Hellos run in a temporary empty directory. Claude tools, MCP servers, and user hooks are disabled for the invocation. Codex ignores user config for the hello and uses its read-only sandbox. Antigravity disables slash commands, enables its sandbox, enforces `strict` tool permissions (which headless print mode soft-denies without executing), and disables paid AI credit overages (`useG1Credits: false`) for the invocation. Provider output is inspected in memory, not saved to the log.
 
@@ -127,32 +127,33 @@ Setup, pause, resume, and uninstall refuse to change settings while a check or h
 From the repository:
 
 ```sh
-npm test
-npm run test:docker
-HI_AI_TEST_LAUNCHD=1 node --test test/macos-launchd.test.mjs
+npm test                                                     # unit suite
+npm run test:docker                                          # npm archive + real cron in Debian, about two minutes
+HI_AI_TEST_LAUNCHD=1 node --test test/macos-launchd.test.mjs # real launchd timer, macOS only
 ```
 
-The local suite covers idle/active usage, provider resets, reboot refresh, deadline latching, weekly blocks, malformed CLI output, timezone and year boundaries, daylight-saving gaps and folds, repeated-failure timer fallback and recovery, RPC requests without inference, and sanitized persisted observations. It also covers lifecycle commands, concurrency, interruption recovery, invalid state, Node upgrade links, fnm cleanup, named launchd exit codes, and provider versus scheduler failures.
-
-The Docker test installs the actual npm archive on Node 22 with Debian cron. Real cron ticks send and repeat fake hellos using controlled usage fixtures, and lifecycle commands preserve unrelated jobs. Allow about two minutes. The macOS test uses a real timer: an active fixture receives no early hello, then both providers are invoked after its reset. It also simulates a Node-link upgrade and provider failure without labeling the schedule broken. No automated scheduler test reads real credentials or sends paid requests.
-
-For explicit live checks:
+These use stand-in provider CLIs, so they read no real credentials and send no paid requests. Live checks use your real accounts and consume usage:
 
 ```sh
-HI_AI_LIVE_TEST=1 npm run test:live
-HI_AI_LIVE_TEST=1 npm run test:live:scheduled
+HI_AI_LIVE_TEST=1 npm run test:live            # one real hello per provider
+HI_AI_LIVE_TEST=1 npm run test:live:scheduled  # macOS: temporary schedule with a real usage read
 ```
 
-`test:live` forces one real hello per provider and consumes usage. `test:live:scheduled` installs a temporary macOS schedule, reads actual usage, and either sends if idle or confirms the saved reset deadline. It then removes the temporary schedule and refuses to replace an existing HiAI LaunchAgent.
+`test:live:scheduled` removes its temporary schedule afterwards and refuses to replace an existing HiAI LaunchAgent.
 
 ## Validation
 
-Verified on one Mac with Claude Code 2.1.311, standalone Codex CLI 0.167.1, and Antigravity CLI 1.5.16:
+Tested on live accounts, one machine per platform:
 
-- **Claude Code and Codex:** live background hello delivery, live usage reads, and a real scheduled `launchd` startup that detected active windows, saved their reported reset times, and sent no early hellos. On 2026-11-12, both were followed through the full idle → hello → newly active window transition on live accounts.
-- **Antigravity:** live zero-inference `agy -p /usage --output-format json` reads across both quota groups (`Gemini Models` active with a fixed five-hour reset, `Claude and GPT models` idle with an advancing reset), a sandboxed scheduled check under `launchd`-equivalent environment variables that latched the active Gemini reset without sending early, a confirmed live `gemini-4-hydrogen-low` hello on macOS, and `0.1.1` → `0.2.0` config compatibility.
+| | macOS (`launchd`) | Linux (`cron`) |
+|---|---|---|
+| Claude Code | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hellos, full reset cycle |
+| Codex | Usage reads, scheduled hellos, full reset cycle | Usage reads, scheduled hello at reset |
+| Antigravity | Usage reads, manual hello | Usage reads, token renewal, manual hello |
 
-On Linux, the unit suite and the Docker real-cron test passed in `0.1.1` on Ubuntu 24.04 (aarch64) with Node 22 using stand-in provider CLIs. Not yet verified for `0.2.0`: a live `launchd` tick and full idle → hello → active reset cycle on Antigravity, re-running `npm run test:docker` with the three-provider fixture, and live authenticated CLIs on Linux (particularly Antigravity under `cron`, where keyring access without a desktop D-Bus session or ADC is untested). Passing scheduler tests or a hello response does not prove that a provider replenishes quota.
+macOS used Claude Code 2.1.311, Codex CLI 0.167.1, and Antigravity CLI 1.5.16. Linux (Ubuntu 24.04, aarch64, signed in over SSH) used Claude Code 2.1.322, Codex CLI 0.166.0, and Antigravity CLI 1.5.17.
+
+Not yet tested: an Antigravity hello sent by the scheduler on either platform, and Antigravity on a Linux desktop that keeps its sign-in in the keyring. A confirmed hello does not prove that a provider replenishes quota.
 
 HiAI delegates authentication to the unmodified Claude Code binary, following the boundary in Anthropic’s [authentication and credential-use rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). Anthropic also [documents scripted CLI usage](https://code.claude.com/docs/en/headless). Provider terms and plan rules apply.
 

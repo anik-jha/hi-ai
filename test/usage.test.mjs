@@ -263,6 +263,13 @@ test('Antigravity parses captured active Gemini usage, matches the model quota g
   // A started 0%-used window keeps a fixed reset_time.
   const startedZero = normalizeAntigravityUsage(antigravityResult(), antigravityNow, antigravityResult(), 'gpt-oss-120b-medium');
   assert.deepEqual([startedZero.state, startedZero.resetAt], ['active', '2026-11-25T10:49:53.000Z']);
+  const underscoreThirdParty = normalizeAntigravityUsage(antigravityResult(), antigravityNow, later, 'claude_sonnet_5_5');
+  assert.deepEqual([underscoreThirdParty.state, underscoreThirdParty.resetAt], ['idle', null]);
+
+  // An unstarted group can instead report the zero timestamp as its reset (captured live).
+  const unset = antigravityResult({ thirdParty5h: { remaining: 1, reset: '1970-01-01T00:00:00Z' }, thirdPartyWeekly: { remaining: 1, reset: '1970-01-01T00:00:00Z' } });
+  const unsetThirdParty = normalizeAntigravityUsage(unset, antigravityNow, undefined, 'claude-sonnet-5-5-low');
+  assert.deepEqual([unsetThirdParty.state, unsetThirdParty.resetAt, unsetThirdParty.usedPercent], ['idle', null, 0]);
 
   // Near-exhausted weekly quota (99.99% used) does not block; 0 remaining does.
   const nearlyFull = antigravityResult({ geminiWeekly: { remaining: 0.0001, reset: '2026-12-02T04:52:39Z' } });
@@ -283,6 +290,7 @@ test('Antigravity parses captured active Gemini usage, matches the model quota g
     antigravityResult({ gemini5h: { remaining: -0.1, reset: '2026-11-25T09:52:39Z' } }),
     antigravityResult({ gemini5h: { remaining: 0.5, reset: 'not-a-date' } }),
     antigravityResult({ gemini5h: { remaining: 0.5, reset: null } }),
+    antigravityResult({ gemini5h: { remaining: 0.5, reset: '1970-01-01T00:00:00Z' } }),
   ]) {
     assert.throws(() => normalizeAntigravityUsage(invalid, antigravityNow));
   }
@@ -314,23 +322,60 @@ test('Antigravity reads active windows once, rechecks unused windows, and hides 
   assert.equal(waits, 1);
   assert.equal(idleReading.state, 'idle');
 
+  // A zero-timestamp reset already means no window, so it needs no recheck.
+  let unsetCalls = 0;
+  const unsetReset = { remaining: 1, reset: '1970-01-01T00:00:00Z' };
+  const unsetReading = await readAntigravityUsage({ ...agy, model: 'claude-sonnet-5-5-low' }, {
+    now: antigravityNow,
+    wait: async () => { waits++; },
+    runner: async () => { unsetCalls++; return { code: 0, stdout: JSON.stringify(antigravityResult({ thirdParty5h: unsetReset, thirdPartyWeekly: unsetReset })) }; },
+  });
+  assert.equal(unsetCalls, 1);
+  assert.equal(waits, 1);
+  assert.equal(unsetReading.state, 'idle');
+
   for (const response of [{ code: 1, stdout: 'secret token' }, { code: 0, timedOut: true }, { code: 0, outputTooLarge: true }, { code: 0, stdout: 'secret token' }]) {
     await assert.rejects(readAntigravityUsage(agy, { runner: async () => response }), error => !error.message.includes('secret token'));
   }
 
   // Since agy rejects fake model names upfront, a future CLI that turned /usage
-  // into a real prompt must trigger a 7-day backoff instead of retrying every 5m.
-  const state = {};
+  // into a real prompt must trigger a 7-day backoff instead of retrying every 5m
+  // or falling back to five-hour timer sends, even after prior failures or
+  // across repeated weekly checks.
+  const weekMs = 7 * 24 * 60 * 60 * 1000;
   const modelTurn = { ...antigravityResult(), command: undefined, num_turns: 1, usage: { input_tokens: 100, output_tokens: 5, total_tokens: 105 } };
-  const ready = await prepareScheduled(agy, {}, state, {
-    now: antigravityNow, boot: 'boot-1',
-    usageReader: () => readAntigravityUsage(agy, { now: antigravityNow, runner: async () => ({ code: 0, stdout: JSON.stringify(modelTurn) }) }),
-  });
-  assert.equal(ready, false);
-  assert.equal(state.usageRetryAt, stamp(antigravityNow + 7 * 24 * 60 * 60 * 1000));
+  const readModelTurn = at => () => readAntigravityUsage(agy, { now: at, runner: async () => ({ code: 0, stdout: JSON.stringify(modelTurn) }) });
+  const state = {};
+  for (let week = 0; week < 3; week++) {
+    const checkAt = antigravityNow + week * weekMs;
+    assert.equal(await prepareScheduled(agy, {}, state, { now: checkAt, boot: 'boot-1', usageReader: readModelTurn(checkAt) }), false);
+    assert.equal(state.usageRetryAt, stamp(checkAt + weekMs));
+    assert.equal(state.usageFallback, undefined);
+  }
   let retries = 0;
-  assert.equal(await prepareScheduled(agy, {}, state, { now: antigravityNow + 60 * 60 * 1000, boot: 'boot-1', usageReader: async () => { retries++; return idle; } }), false);
+  assert.equal(await prepareScheduled(agy, {}, state, { now: antigravityNow + 2 * weekMs + 60 * 60 * 1000, boot: 'boot-1', usageReader: async () => { retries++; return idle; } }), false);
   assert.equal(retries, 0);
+
+  const priorFailures = { usageFailures: 2, usageFallback: true };
+  assert.equal(await prepareScheduled(agy, {}, priorFailures, { now: antigravityNow, boot: 'boot-1', usageReader: readModelTurn(antigravityNow) }), false);
+  assert.equal(priorFailures.usageRetryAt, stamp(antigravityNow + weekMs));
+  assert.equal(priorFailures.usageFallback, undefined);
+
+  // Any spent token counter is inference, including ones the validity check ignores.
+  const thinkingOnly = { ...antigravityResult(), usage: { ...antigravityResult().usage, thinking_tokens: 12 } };
+  assert.throws(() => normalizeAntigravityUsage(thinkingOnly, antigravityNow), error => error.retryAfterMs === weekMs && error.pauseFallback === true);
+
+  // A renamed command field with zero turns and tokens is a format change: it
+  // retries in five minutes and reaches the timer fallback after three reads.
+  const renamed = { ...antigravityResult(), command: { ...antigravityResult().command, name: 'quota' } };
+  const formatState = {};
+  const readRenamed = () => readAntigravityUsage(agy, { now: antigravityNow, runner: async () => ({ code: 0, stdout: JSON.stringify(renamed) }) });
+  for (const [index, elapsed] of [0, 300_000, 600_000].entries()) {
+    const due = await prepareScheduled(agy, {}, formatState, { now: antigravityNow + elapsed, boot: 'boot-1', usageReader: readRenamed });
+    assert.equal(formatState.usageRetryAt, stamp(antigravityNow + elapsed + 300_000));
+    assert.equal(due, index === 2);
+  }
+  assert.equal(formatState.usageFallback, true);
 });
 
 test('Claude subprocess errors, invalid JSON, and model responses become unknown usage without logging output', async () => {

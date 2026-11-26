@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout } from 'node:timers/promises';
-import { deliveryConfirmed, execute, FIVE_HOURS_MS, RETRY_DELAY_MS, firstStart, nextDueAt, validateTime } from '../lib/core.mjs';
+import { captureAuthPaths, deliveryConfirmed, execute, FIVE_HOURS_MS, RETRY_DELAY_MS, firstStart, nextDueAt, validateTime } from '../lib/core.mjs';
 import { cronText, nodeExecutable, plistText, stripCron } from '../lib/scheduler.mjs';
 import { bootId } from '../lib/usage.mjs';
 
@@ -27,6 +27,7 @@ async function fixture(t) {
     OPENAI_API_KEY: 'test-only', CODEX_API_KEY: 'test-only',
     ANTHROPIC_API_KEY: 'test-only', ANTHROPIC_AUTH_TOKEN: 'test-only',
     GEMINI_API_KEY: 'test-only', GOOGLE_API_KEY: 'test-only',
+    SSH_CONNECTION: '', SSH_CLIENT: '', SSH_TTY: '', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '',
   };
   const writeScript = async (name, text) => fs.writeFile(path.join(bin, name), `#!/usr/bin/env node\n${text}`, { mode: 0o755 });
   for (const [name, binary] of [['claude', 'claude'], ['codex', 'codex'], ['antigravity', 'agy']]) await writeScript(binary, `
@@ -37,7 +38,8 @@ if (process.env.SLOW_PROVIDER === ${JSON.stringify(name)}) {
 }
 fs.appendFileSync(process.env.FIXTURE + '/calls', JSON.stringify({
   name: ${JSON.stringify(name)}, args: process.argv.slice(2), cwd: process.cwd(),
-  apiKeyPresent: ['OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','GEMINI_API_KEY','GOOGLE_API_KEY'].some(k => k in process.env)
+  apiKeyPresent: ['OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','GEMINI_API_KEY','GOOGLE_API_KEY'].some(k => k in process.env),
+  authEnv: Object.fromEntries(['XDG_RUNTIME_DIR','DBUS_SESSION_BUS_ADDRESS','AGY_ADC_AUTH','AGY_CLI_FORCE_FILE_TOKEN_STORAGE','GOOGLE_APPLICATION_CREDENTIALS','CLOUDSDK_CONFIG'].map(k => [k, process.env[k] ?? null]))
 }) + '\\n');
 if (process.env.BAD_OUTPUT !== ${JSON.stringify(name)}) {
   if (${JSON.stringify(name)} === 'claude') console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'hi'}));
@@ -635,4 +637,50 @@ test('Antigravity supports the agy alias, isolates hello flags, and discovers ~/
   `], { cwd: root, env: { ...process.env, HOME: fallbackHome, PATH: '' }, encoding: 'utf8' });
   assert.equal(lookup.status, 0, lookup.stderr);
   assert.equal(lookup.stdout.trim(), fallbackAgy);
+});
+
+test('Antigravity auth and session env vars propagate to cron runs without clobbering a live session', async t => {
+  const f = await fixture(t);
+  const setupEnv = {
+    XDG_RUNTIME_DIR: '/run/user/1000',
+    DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus-old',
+    AGY_ADC_AUTH: '1',
+    AGY_CLI_FORCE_FILE_TOKEN_STORAGE: null,
+    GOOGLE_APPLICATION_CREDENTIALS: '/tmp/adc.json',
+    CLOUDSDK_CONFIG: '/tmp/gcloud',
+  };
+  assert.equal(f.call(['setup', '--providers', 'antigravity'], { ...setupEnv, AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' }).status, 0);
+
+  // Under a bare cron environment (no session vars), saved values are restored.
+  assert.equal(f.call(['run'], { XDG_RUNTIME_DIR: '', DBUS_SESSION_BUS_ADDRESS: '', AGY_ADC_AUTH: '', GOOGLE_APPLICATION_CREDENTIALS: '', CLOUDSDK_CONFIG: '' }).status, 0);
+  // In a newer live desktop session, current D-Bus/runtime vars take precedence.
+  assert.equal(f.call(['run'], { XDG_RUNTIME_DIR: '/run/user/2000', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/2000/bus-new' }).status, 0);
+
+  // Linux SSH setup automatically forces file-based token storage for bare cron runs.
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'linux'), { AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '1' });
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'darwin'), {});
+  assert.deepEqual(captureAuthPaths([{ name: 'claude' }], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }, 'linux'), {});
+  assert.deepEqual(captureAuthPaths([{ name: 'antigravity' }], { SSH_TTY: '/dev/pts/1', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '0' }, 'linux'), { AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '0' });
+
+  if (process.platform === 'linux') {
+    assert.equal(f.call(['setup', '--providers', 'antigravity'], { SSH_CONNECTION: '1.2.3.4 5000 5.6.7.8 22' }).status, 0);
+    assert.equal(f.call(['run'], { SSH_CONNECTION: '', AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' }).status, 0);
+  }
+
+  const calls = await f.calls();
+  assert.deepEqual(calls[0].authEnv, { ...setupEnv, AGY_CLI_FORCE_FILE_TOKEN_STORAGE: '' });
+  assert.equal(calls[1].authEnv.XDG_RUNTIME_DIR, '/run/user/2000');
+  assert.equal(calls[1].authEnv.DBUS_SESSION_BUS_ADDRESS, 'unix:path=/run/user/2000/bus-new');
+  assert.equal(calls[1].authEnv.AGY_ADC_AUTH, '1');
+  if (process.platform === 'linux') assert.equal(calls[2].authEnv.AGY_CLI_FORCE_FILE_TOKEN_STORAGE, '1');
+
+  // Status surfaces a paused usage-retry window even before the first usage read.
+  const statePath = path.join(f.env.HI_AI_HOME, 'state.json');
+  const retryAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  await fs.writeFile(statePath, JSON.stringify({
+    antigravity: { usageError: 'antigravity usage check unavailable: pausing checks.', usageRetryAt: retryAt },
+  }));
+  const status = f.call(['status']);
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /after usage check retry \(/);
 });
